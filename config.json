@@ -1,0 +1,16 @@
+{
+  "source": [
+    {
+      "url": "https://ch.iqos.com",
+      "maxDepth": 2,
+      "id": "ch.iqos"
+    }
+  ],
+  "projectId": "rrp-analytics-bq-projects",
+  "pubsubTopicId": "launch-lighthouse",
+  "datasetId": "lighthouse",
+  "minTimeBetweenTriggers": 300000,
+  "gcs": {
+    "bucketName": "iqos-lighthouse-reports"
+  }
+}

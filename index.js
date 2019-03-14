@@ -38,6 +38,10 @@ const bqSchema = require(`./bigquery-schema.json`);
 const config = require(`./config.json`);
 const configSchema = require(`./config.schema.json`);
 
+const cheerio = require('cheerio')
+const Crawler = require('simplecrawler')
+const queue = require('async/queue')
+
 // Make filesystem write work with async/await
 const writeFile = promisify(fs.writeFile);
 const readFile = promisify(fs.readFile);
@@ -66,17 +70,17 @@ const log = console.log;
  */
 async function launchBrowserWithLighthouse(id, url) {
 
-  log(`${id}: Starting browser for ${url}`);
+  // log(`${id}: Starting browser for ${url}`);
 
   const browser = await puppeteer.launch({args: ['--no-sandbox']});
 
-  log(`${id}: Browser started for ${url}`);
+  // log(`${id}: Browser started for ${url}`);
 
   config.lighthouseFlags = config.lighthouseFlags || {};
 
   config.lighthouseFlags.port = (new URL(browser.wsEndpoint())).port;
 
-  log(`${id}: Starting lighthouse for ${url}`);
+  // log(`${id}: Starting lighthouse for ${url}`);
 
   const lhr = await lighthouse(url, config.lighthouseFlags);
 
@@ -84,7 +88,7 @@ async function launchBrowserWithLighthouse(id, url) {
 
   await browser.close();
 
-  log(`${id}: Browser closed for ${url}`);
+  // log(`${id}: Browser closed for ${url}`);
 
   return lhr;
 }
@@ -253,7 +257,7 @@ async function writeLogAndReportsToStorage(obj, id) {
     });
   }));
   const file = bucket.file(`${id}/log_${obj.lhr.fetchTime}.json`);
-  log(`${id}: Writing log to bucket ${config.gcs.bucketName}`);
+  // log(`${id}: Writing log to bucket ${config.gcs.bucketName}`);
   return await file.save(JSON.stringify(obj.lhr, null, " "), {
     metadata: {contentType: 'application/json'}
   });
@@ -305,13 +309,8 @@ async function launchLighthouse (event, callback) {
 
     const source = config.source;
     const msg = Buffer.from(event.data, 'base64').toString();
+    console.log(msg);
     const ids = source.map(obj => obj.id);
-    const uuid = uuidv1();
-    const metadata = {
-      sourceFormat: 'NEWLINE_DELIMITED_JSON',
-      schema: {fields: bqSchema},
-      jobId: uuid
-    };
 
     // If the Pub/Sub message is not valid
     if (msg !== 'all' && !ids.includes(msg)) { return console.error('No valid message found!'); }
@@ -321,8 +320,27 @@ async function launchLighthouse (event, callback) {
     const [src] = source.filter(obj => obj.id === msg);
     const id = src.id;
     const url = src.url;
+    const maxDepth = src.maxDepth;
 
     log(`${id}: Received message to start with URL ${url}`);
+
+    //Initiate Crawler
+    const crawler = new Crawler(url);
+    crawler.respectRobotsTxt = false
+    crawler.parseHTMLComments = false
+    crawler.parseScriptTags = false
+    crawler.maxDepth = maxDepth || 1
+    crawler.listenerTTL = 5000;
+    crawler.setMaxListeners(50);
+    
+    //Crawler gets urls
+    crawler.discoverResources = (buffer, item) => {
+      const page = cheerio.load(buffer.toString('utf8'))
+      const links = page('a[href]').map(function () {
+              return page(this).attr('href')
+      }).get()
+      return links
+    }
 
     const timeNow = new Date().getTime();
     const eventState = await checkEventState(id, timeNow);
@@ -330,21 +348,42 @@ async function launchLighthouse (event, callback) {
       return log(`${id}: Found active event (${Math.round(eventState.delta)}s < ${Math.round(config.minTimeBetweenTriggers/1000)}s), aborting...`);
     }
 
-    const res = await launchBrowserWithLighthouse(id, url);
+    const lighthouseQueue = queue(async (url, callback) => {
+      const uuid = uuidv1();
+      const metadata = {
+        sourceFormat: 'NEWLINE_DELIMITED_JSON',
+        schema: {
+          fields: bqSchema
+        },
+        jobId: uuid
+      };
+      const res = await launchBrowserWithLighthouse(id, url);
+      await writeLogAndReportsToStorage(res, id);
 
-    await writeLogAndReportsToStorage(res, id);
-    const json = createJSON(res.lhr, id);
+      const json = createJSON(res.lhr, id);
+      json.job_id = uuid;
 
-    json.job_id = uuid;
+      await writeFile(`/tmp/${uuid}.json`, toNdjson(json));
+      log(`ID ${uuid} for ${url}`);
+      log(`${id}: BigQuery job with ID ${uuid} starting for ${url}`);
+      await bigqueryx
+        .dataset(config.datasetId)
+        .table('reports')
+        .load(`/tmp/${uuid}.json`, metadata);
+      callback()
+    }, 1)
 
-    await writeFile(`/tmp/${uuid}.json`, toNdjson(json));
+    crawler.on('fetchcomplete', (queueItem, responseBuffer, response) => {
+      lighthouseQueue.push(queueItem.url)
+    });
 
-    log(`${id}: BigQuery job with ID ${uuid} starting for ${url}`);
+    crawler.once('complete', () => {
+      lighthouseQueue.drain = () => {
+          process.exit(1)
+      }
+    })
 
-    return bigquery
-      .dataset(config.datasetId)
-      .table('reports')
-      .load(`/tmp/${uuid}.json`, metadata);
+    crawler.start();
 
   } catch(e) {
     console.error(e);
